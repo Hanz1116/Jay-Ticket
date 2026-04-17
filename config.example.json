@@ -1,3 +1,4 @@
 {
-  "ticketmaster_api_key": "YOUR_API_KEY_HERE"
+  "ticketmaster_api_key": "YOUR_TICKETMASTER_API_KEY_HERE",
+  "ntfy_topic": "YOUR_UNIQUE_TOPIC_NAME_HERE"
 }
