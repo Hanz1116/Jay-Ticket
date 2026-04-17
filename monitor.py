@@ -35,15 +35,13 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
-    """Load from environment variables (Replit Secrets) or config.json."""
-    # Replit Secrets show up as environment variables
+    """Load from Replit Secrets (env vars) or local config.json."""
     tm_key     = os.environ.get("TICKETMASTER_API_KEY", "").strip()
     ntfy_topic = os.environ.get("NTFY_TOPIC", "").strip()
 
     if tm_key and ntfy_topic:
         return {"ticketmaster_api_key": tm_key, "ntfy_topic": ntfy_topic}
 
-    # Fallback: local config.json
     path = Path(__file__).parent / "config.json"
     if not path.exists():
         log.error("No secrets found. Set TICKETMASTER_API_KEY and NTFY_TOPIC in Replit Secrets.")
@@ -65,36 +63,14 @@ def load_config() -> dict:
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
 
-SESSION = requests.Session()
+SESSION  = requests.Session()
 SESSION.headers.update({"User-Agent": "TicketMonitor/1.0"})
+SEAT_URL = "https://services.ticketmaster.com/api/ismds/event/{id}/seat"
 
-DISCOVERY_URL = "https://app.ticketmaster.com/discovery/v2/events/{id}"
-INVENTORY_URL = "https://app.ticketmaster.com/inventory-status/v1/availability"
-SEAT_URL      = "https://services.ticketmaster.com/api/ismds/event/{id}/seat"
-
-# ── Ticketmaster helpers ──────────────────────────────────────────────────────
-
-def get_event_name(api_key: str) -> str:
-    try:
-        r = SESSION.get(
-            DISCOVERY_URL.format(id=EVENT_ID),
-            params={"apikey": api_key},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json().get("name", "Unknown Event")
-    except Exception as exc:
-        log.warning("Could not fetch event name: %s", exc)
-        return "Unknown Event"
-
+# ── Availability check ────────────────────────────────────────────────────────
 
 def check_available_sections(api_key: str) -> list[str]:
-    """Return sorted list of target sections that currently have tickets.
-
-    Primary:  ISMDS seat endpoint (section-level granularity).
-    Fallback: inventory-status endpoint (event-level only).
-    """
-    # ── Primary: ISMDS seat endpoint ─────────────────────────────────────
+    """Return sorted list of target sections that currently have tickets."""
     try:
         r = SESSION.get(
             SEAT_URL.format(id=EVENT_ID),
@@ -109,29 +85,22 @@ def check_available_sections(api_key: str) -> list[str]:
                 if p.get("section", "").strip() in TARGET_SECTIONS
             }
             return sorted(found)
-        log.debug("ISMDS returned %s – trying inventory-status fallback", r.status_code)
+        if r.status_code == 401:
+            log.error(
+                "ISMDS returned 401 Unauthorized. "
+                "Your API key may not have access to this endpoint. "
+                "Double-check your key at developer.ticketmaster.com."
+            )
+        elif r.status_code == 404:
+            log.error(
+                "ISMDS returned 404 – event ID %s not found. "
+                "Verify the event ID is correct and the event hasn't ended.",
+                EVENT_ID,
+            )
+        else:
+            log.warning("ISMDS returned unexpected status %s.", r.status_code)
     except requests.RequestException as exc:
-        log.debug("ISMDS request error: %s – trying fallback", exc)
-
-    # ── Fallback: inventory-status (event-level) ──────────────────────────
-    try:
-        r = SESSION.get(
-            INVENTORY_URL,
-            params={"events": EVENT_ID, "apikey": api_key},
-            timeout=15,
-        )
-        r.raise_for_status()
-        avail = (
-            r.json()
-            .get("_embedded", {})
-            .get("availability", [{}])[0]
-            .get("availability", {})
-        )
-        if avail.get("status") == "available":
-            log.info("Event shows tickets available (section detail unavailable at this API tier).")
-            return ["(section detail unavailable – check Ticketmaster)"]
-    except Exception as exc:
-        log.error("Inventory-status check failed: %s", exc)
+        log.error("Network error checking availability: %s", exc)
 
     return []
 
@@ -169,9 +138,6 @@ def main() -> None:
     log.info("ntfy topic: %s", ntfy_topic)
     log.info("=" * 60)
 
-    event_name = get_event_name(api_key)
-    log.info("Monitoring : %s", event_name)
-
     def _shutdown(sig, _frame):
         log.info("Shutting down.")
         sys.exit(0)
@@ -189,10 +155,10 @@ def main() -> None:
 
         if new:
             msg = f"Sections available: {', '.join(found)}"
-            log.info("ALERT  %s  |  %s", event_name, msg)
+            log.info("ALERT  %s  |  %s", EVENT_ID, msg)
             send_phone_notification(
                 ntfy_topic,
-                f"Tickets Available – {event_name}",
+                "Tickets Available!",
                 msg,
             )
             notified.update(found)
