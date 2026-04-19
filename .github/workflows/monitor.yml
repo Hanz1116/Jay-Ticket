@@ -11,20 +11,22 @@ jobs:
 
     steps:
       - name: Install dependencies
-        run: pip3 install requests --quiet
+        run: |
+          pip3 install playwright anthropic requests --quiet
+          playwright install chromium --with-deps --quiet
 
-      - name: Check ticket availability
+      - name: Check ticket availability via Claude Vision
         shell: python3 {0}
         env:
-          TICKETMASTER_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          import logging, os, sys
-          import requests
+          import base64, logging, os, sys, time
+          import anthropic, requests
+          from playwright.sync_api import sync_playwright
 
-          EVENT_ID        = "2500647FEE7EB74F"
-          TARGET_SECTIONS = {"A3", "A4", "A5", "A6", "A7", "A8"}
-          SEAT_URL        = "https://services.ticketmaster.com/api/ismds/event/{id}/seat"
+          EVENT_URL       = "https://www.ticketmaster.com/event/2500647FEE7EB74F"
+          TARGET_SECTIONS = ["A3", "A4", "A5", "A6", "A7", "A8"]
 
           logging.basicConfig(
               level=logging.INFO,
@@ -34,63 +36,93 @@ jobs:
           )
           log = logging.getLogger(__name__)
 
-          api_key    = os.environ.get("TICKETMASTER_API_KEY", "").strip()
-          ntfy_topic = os.environ.get("NTFY_TOPIC", "").strip()
+          anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+          ntfy_topic    = os.environ.get("NTFY_TOPIC", "").strip()
 
-          if not api_key or not ntfy_topic:
-              log.error("TICKETMASTER_API_KEY and NTFY_TOPIC must be set as GitHub Secrets.")
+          if not anthropic_key or not ntfy_topic:
+              log.error("ANTHROPIC_API_KEY and NTFY_TOPIC must be set as GitHub Secrets.")
               sys.exit(1)
 
-          log.info("Checking event %s for sections %s …", EVENT_ID, ", ".join(sorted(TARGET_SECTIONS)))
-
-          HEADERS = {
-              "User-Agent":      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-              "Accept":          "application/json",
-              "Accept-Language": "en-US,en;q=0.9",
-              "Referer":         "https://www.ticketmaster.com/",
-          }
-
-          # ── Check availability ────────────────────────────────────────────────
-          found = []
+          # ── Step 1: load Ticketmaster in a real browser and screenshot ────────
+          log.info("Opening Ticketmaster event page …")
+          screenshot = None
           try:
-              r = requests.get(
-                  SEAT_URL.format(id=EVENT_ID),
-                  params={"apikey": api_key, "q": "available", "show": "places", "mode": "primary"},
-                  headers=HEADERS,
-                  timeout=20,
-              )
-              if r.status_code == 200:
-                  places = r.json().get("places", [])
-                  found = sorted({
-                      p.get("section", "").strip()
-                      for p in places
-                      if p.get("section", "").strip() in TARGET_SECTIONS
-                  })
-              elif r.status_code == 401:
-                  log.error("401 Unauthorized — check your TICKETMASTER_API_KEY secret.")
-              elif r.status_code == 403:
-                  log.error("403 Forbidden — Ticketmaster is blocking this request. The API key may lack access to this endpoint.")
-              elif r.status_code == 404:
-                  log.error("404 — event ID %s not found.", EVENT_ID)
-              else:
-                  log.warning("Unexpected status %s.", r.status_code)
-          except requests.RequestException as exc:
-              log.error("Network error: %s", exc)
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+                  ctx = browser.new_context(
+                      user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+                      viewport={"width": 390, "height": 844},
+                  )
+                  page = ctx.new_page()
+                  page.goto(EVENT_URL, wait_until="networkidle", timeout=30000)
+                  time.sleep(5)   # let seatmap finish rendering
+                  screenshot = page.screenshot()
+                  browser.close()
+              log.info("Screenshot captured (%d bytes).", len(screenshot))
+          except Exception as exc:
+              log.error("Browser error: %s", exc)
+              sys.exit(1)
 
-          # ── Notify ───────────────────────────────────────────────────────────
-          if found:
-              msg = f"Sections available: {', '.join(found)}"
-              log.info("ALERT — %s", msg)
+          # ── Step 2: ask Claude to read the seatmap ────────────────────────────
+          log.info("Sending screenshot to Claude Vision …")
+          try:
+              client  = anthropic.Anthropic(api_key=anthropic_key)
+              message = client.messages.create(
+                  model="claude-haiku-4-5-20251001",
+                  max_tokens=200,
+                  messages=[{
+                      "role": "user",
+                      "content": [
+                          {
+                              "type": "image",
+                              "source": {
+                                  "type": "base64",
+                                  "media_type": "image/png",
+                                  "data": base64.standard_b64encode(screenshot).decode(),
+                              },
+                          },
+                          {
+                              "type": "text",
+                              "text": (
+                                  "This is a Ticketmaster event page or seatmap. "
+                                  f"Tell me which of these sections are available for purchase: {', '.join(TARGET_SECTIONS)}. "
+                                  "Available sections are shown in colour (blue, green, orange, etc.). "
+                                  "Unavailable/sold-out sections are grey. "
+                                  "Reply with ONLY one of these exact formats:\n"
+                                  "AVAILABLE: A3, A5\n"
+                                  "NONE\n"
+                                  "UNKNOWN (only if the seatmap is not visible at all)"
+                              ),
+                          },
+                      ],
+                  }],
+              )
+              result = message.content[0].text.strip()
+              log.info("Claude says: %s", result)
+          except Exception as exc:
+              log.error("Claude API error: %s", exc)
+              sys.exit(1)
+
+          # ── Step 3: notify if sections are available ──────────────────────────
+          if result.startswith("AVAILABLE:"):
+              sections = result.replace("AVAILABLE:", "").strip()
+              log.info("ALERT — sections available: %s", sections)
               try:
                   r = requests.post(
                       f"https://ntfy.sh/{ntfy_topic}",
-                      data=msg.encode(),
-                      headers={"Title": "Tickets Available!", "Priority": "urgent", "Tags": "rotating_light,ticket"},
+                      data=f"Sections available: {sections}".encode(),
+                      headers={
+                          "Title":    "Tickets Available!",
+                          "Priority": "urgent",
+                          "Tags":     "rotating_light,ticket",
+                      },
                       timeout=10,
                   )
                   r.raise_for_status()
                   log.info("Phone notification sent.")
               except Exception as exc:
                   log.error("ntfy failed: %s", exc)
-          else:
+          elif result == "NONE":
               log.info("No target sections available.")
+          else:
+              log.warning("Could not read seatmap — Ticketmaster may have shown a bot-check page.")
