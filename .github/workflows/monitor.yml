@@ -21,8 +21,15 @@ jobs:
           import logging, os, sys
           import requests
 
-          EVENT_ID        = "2500647FEE7EB74F"
-          TARGET_SECTIONS = {"A3", "A4", "A5", "A6", "A7", "A8"}
+          EVENT_ID = "2500647FEE7EB74F"
+          SECTIONS = {
+              "A3": "IEZQ",
+              "A4": "IE2A",
+              "A5": "IE2Q",
+              "A6": "IE3A",
+              "A7": "IE3Q",
+              "A8": "IE4A",
+          }
 
           logging.basicConfig(
               level=logging.INFO,
@@ -37,26 +44,30 @@ jobs:
               log.error("NTFY_TOPIC must be set as a GitHub Secret.")
               sys.exit(1)
 
-          MANIFEST_URL = f"https://pubapi.ticketmaster.com/sdk/static/manifest/v1/{EVENT_ID}"
-
-          log.info("Checking pubapi manifest (no auth required) …")
+          # ── Fetch manifest (public, no auth needed) ───────────────────────────
+          log.info("Fetching availability manifest …")
           try:
-              r = requests.get(MANIFEST_URL, timeout=15)
+              r = requests.get(
+                  f"https://pubapi.ticketmaster.com/sdk/static/manifest/v1/{EVENT_ID}",
+                  timeout=15,
+              )
               r.raise_for_status()
-              data = r.json()
+              place_ids = set(r.json().get("placeIds", []))
           except Exception as exc:
-              log.error("API error: %s", exc)
+              log.error("Failed to fetch manifest: %s", exc)
               sys.exit(1)
 
-          place_ids    = data.get("placeIds", [])
-          update_time  = data.get("updateTime", "unknown")
-          log.info("Manifest fetched — %d available place IDs (updated %s)", len(place_ids), update_time)
-          log.info("Sample place IDs: %s", place_ids[:5])
+          log.info("Available place IDs in manifest: %d", len(place_ids))
 
-          # TODO: map place IDs to section names once we know the mapping
-          # For now log all data so we can identify A3-A8 place ID patterns
-          found = []
+          # ── Check which target sections have available seats ───────────────────
+          found = [
+              section for section, prefix in SECTIONS.items()
+              if any(pid.startswith(prefix) for pid in place_ids)
+          ]
 
+          log.info("Target sections available: %s", ", ".join(found) or "none")
+
+          # ── Notify ────────────────────────────────────────────────────────────
           if found:
               msg = f"Sections available: {', '.join(found)}"
               log.info("ALERT — %s", msg)
