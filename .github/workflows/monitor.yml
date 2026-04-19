@@ -12,8 +12,8 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          pip3 install playwright requests --quiet
-          playwright install chromium --with-deps --quiet
+          pip3 install playwright requests -q
+          playwright install chromium --with-deps
 
       - name: Check ticket availability
         shell: python3 {0}
