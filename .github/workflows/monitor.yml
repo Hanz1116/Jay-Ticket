@@ -11,20 +11,17 @@ jobs:
 
     steps:
       - name: Install dependencies
-        run: |
-          pip3 install playwright requests -q
-          playwright install chromium --with-deps
+        run: pip3 install requests -q
 
       - name: Check ticket availability
         shell: python3 {0}
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          import json, logging, os, sys, time
+          import logging, os, sys
           import requests
-          from playwright.sync_api import sync_playwright
 
-          EVENT_URL       = "https://www.ticketmaster.com.au/jay-chou-carnival-ii-world-tour-in-melbourne-docklands-17-10-2026/event/2500647FEE7EB74F"
+          EVENT_ID        = "2500647FEE7EB74F"
           TARGET_SECTIONS = {"A3", "A4", "A5", "A6", "A7", "A8"}
 
           logging.basicConfig(
@@ -40,93 +37,35 @@ jobs:
               log.error("NTFY_TOPIC must be set as a GitHub Secret.")
               sys.exit(1)
 
-          # ── Intercept every JSON response the page makes ──────────────────────
-          captured = []
+          QUICKPICKS_URL = (
+              f"https://www.ticketmaster.com.au/api/quickpicks/{EVENT_ID}/list"
+              "?sort=price&offset=0&qty=1&primary=true&resale=false"
+              "&tids=000000000001%2C00020D800001%2C00020E000001%2C00000E010008"
+              "&resaleProvider=INTL"
+          )
+          HEADERS = {
+              "User-Agent":  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+              "Accept":      "application/json",
+              "Referer":     "https://www.ticketmaster.com.au/",
+          }
 
-          def on_response(response):
-              ct = response.headers.get("content-type", "")
-              if "json" not in ct:
-                  return
-              try:
-                  captured.append(response.json())
-              except Exception:
-                  pass
-
-          log.info("Loading Ticketmaster page …")
-          found = set()
-
+          log.info("Checking quickpicks API …")
           try:
-              with sync_playwright() as p:
-                  browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
-                  ctx = browser.new_context(
-                      user_agent=(
-                          "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                          "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                          "Version/17.0 Mobile/15E148 Safari/604.1"
-                      ),
-                      viewport={"width": 390, "height": 844},
-                      locale="en-AU",
-                  )
-                  page = ctx.new_page()
-                  page.on("response", on_response)
-                  try:
-                      page.goto(EVENT_URL, wait_until="domcontentloaded", timeout=40000)
-                  except Exception:
-                      pass  # partial load is fine — we just need the JSON responses
-                  time.sleep(8)   # let seatmap API calls finish
-
-                  # ── Method 1: scan intercepted JSON for section availability ──
-                  raw = json.dumps(captured)
-                  for section in TARGET_SECTIONS:
-                      # sections appear as "section":"A3" or "sectionName":"A3" etc.
-                      if f'"{section}"' in raw or f"'{section}'" in raw:
-                          found.add(section)
-
-                  # ── Method 2: query the live DOM via JavaScript ───────────────
-                  dom_found = page.evaluate("""
-                  (targets) => {
-                      const found = [];
-                      targets.forEach(sec => {
-                          // Try every common attribute pattern Ticketmaster uses
-                          const selectors = [
-                              `[id="${sec}"]`,
-                              `[data-section="${sec}"]`,
-                              `[aria-label*="${sec}"]`,
-                              `[data-name="${sec}"]`,
-                              `[title="${sec}"]`,
-                              `[data-section-name="${sec}"]`,
-                          ];
-                          for (const sel of selectors) {
-                              const els = [...document.querySelectorAll(sel)];
-                              for (const el of els) {
-                                  const cls  = (el.className || '').toString().toLowerCase();
-                                  const disabled = el.getAttribute('aria-disabled') === 'true'
-                                      || cls.includes('sold')
-                                      || cls.includes('unavailable')
-                                      || cls.includes('disabled');
-                                  if (!disabled) { found.push(sec); break; }
-                              }
-                          }
-                      });
-                      return [...new Set(found)];
-                  }
-                  """, list(TARGET_SECTIONS))
-
-                  for s in dom_found:
-                      found.add(s)
-
-                  log.info("Page title: %s", page.title())
-                  log.info("JSON blobs captured: %d", len(captured))
-                  log.info("DOM sections found: %s", dom_found)
-
-                  browser.close()
-
+              r = requests.get(QUICKPICKS_URL, headers=HEADERS, timeout=15)
+              r.raise_for_status()
+              data = r.json()
           except Exception as exc:
-              log.error("Browser error: %s", exc)
+              log.error("API error: %s", exc)
               sys.exit(1)
 
-          # ── Notify ────────────────────────────────────────────────────────────
-          found = sorted(found)
+          all_sections = {pick["section"] for pick in data.get("picks", [])}
+          found        = sorted(all_sections & TARGET_SECTIONS)
+          total_picks  = data.get("total", 0)
+
+          log.info("Total available picks: %d", total_picks)
+          log.info("All available sections: %s", ", ".join(sorted(all_sections)) or "none")
+          log.info("Target sections found:  %s", ", ".join(found) or "none")
+
           if found:
               msg = f"Sections available: {', '.join(found)}"
               log.info("ALERT — %s", msg)
@@ -145,5 +84,3 @@ jobs:
                   log.info("Phone notification sent.")
               except Exception as exc:
                   log.error("ntfy failed: %s", exc)
-          else:
-              log.info("No target sections available (A3–A8).")
